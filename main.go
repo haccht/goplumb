@@ -16,8 +16,6 @@ import (
 	"github.com/rivo/tview"
 )
 
-const bufferSize = 1024 * 1024
-
 func shell() string {
 	shell := os.Getenv("SHELL")
 	if shell != "" {
