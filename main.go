@@ -16,23 +16,23 @@ import (
 	"github.com/rivo/tview"
 )
 
-func shell() string {
+func getShell() (string, error) {
 	shell := os.Getenv("SHELL")
 	if shell != "" {
-		return shell
+		return shell, nil
 	}
 
 	shell, _ = exec.LookPath("bash")
 	if shell != "" {
-		return shell
+		return shell, nil
 	}
 
 	shell, _ = exec.LookPath("sh")
 	if shell != "" {
-		return shell
+		return shell, nil
 	}
 
-	return ""
+	return "", fmt.Errorf("shell not found")
 }
 
 type App struct {
@@ -120,7 +120,7 @@ func (a *App) runCommand(in io.Reader, synchronize bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 
-	r := a.subprocess(ctx, in)
+	r := a.command(ctx, in)
 	if synchronize {
 		a.render(ctx, r)
 	} else {
@@ -138,22 +138,29 @@ func (a *App) render(ctx context.Context, r io.Reader) {
 			fmt.Fprintln(a.Text, tview.TranslateANSI(s.Text()))
 
 			a.result = append(a.result, s.Text())
-			a.Count.SetText(fmt.Sprintf("%4d lines", len(a.result)))
+			a.Count.SetText(fmt.Sprintf("%d lines", len(a.result)))
 		}
 	}
 }
 
-func (a *App) subprocess(ctx context.Context, in io.Reader) io.Reader {
+func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
 	r, w := io.Pipe()
 
-	c := exec.CommandContext(ctx, shell(), "-c", a.getCommand())
+	shell, err := getShell()
+	if err != nil {
+		fmt.Fprintf(a.Text, "Error: %s", err)
+		return r
+	}
+
+	c := exec.CommandContext(ctx, shell, "-c", a.getCommand())
 	c.Stdin = in
 	c.Stdout = w
 	c.Stderr = w
 
-	err := c.Start()
+	err = c.Start()
 	if err != nil {
 		fmt.Fprintf(a.Text, "Error: %s", err)
+		return r
 	}
 
 	go func() {
