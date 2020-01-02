@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -15,6 +14,8 @@ import (
 	"github.com/mattn/go-isatty"
 	"github.com/rivo/tview"
 )
+
+const bufSize = 32 * 1024
 
 func getShell() (string, error) {
 	shell := os.Getenv("SHELL")
@@ -35,35 +36,41 @@ func getShell() (string, error) {
 	return "", fmt.Errorf("shell not found")
 }
 
+func getProgramName() string {
+	return filepath.Base(os.Args[0])
+}
+
 type App struct {
 	ui     *tview.Application
 	br     *bufferedReader
-	result []string
+	result *bytes.Buffer
 	cancel context.CancelFunc
 
-	Edit  *tview.InputField
-	Text  *tview.TextView
-	Count *tview.TextView
+	Edit *tview.InputField
+	Text *tview.TextView
+	Size *tview.TextView
 }
 
 func NewApp() *App {
 	a := &App{
 		ui:     tview.NewApplication(),
 		br:     NewBufferedReader(os.Stdin),
-		result: []string{},
+		result: bytes.NewBufferString(""),
+		cancel: nil,
 	}
 
 	a.Edit = tview.NewInputField()
-	a.Edit.SetLabel("-->| ").SetLabelColor(tcell.ColorLawnGreen)
+	a.Edit.SetLabel(fmt.Sprintf("%s | ", getProgramName())).SetLabelColor(tcell.ColorForestGreen)
 	a.Edit.SetPlaceholder("cat").SetPlaceholderTextColor(tcell.ColorDarkGray)
+	a.Edit.SetBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetFieldBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetDoneFunc(func(key tcell.Key) {
 		a.cancel()
 		a.Text.Clear()
-		a.Count.Clear()
+		a.Size.Clear()
 
 		a.br.mu.Lock()
-		a.result = nil
+		a.result.Reset()
 		a.runCommand(a.br.Buffer(), true)
 		a.br.mu.Unlock()
 
@@ -75,10 +82,7 @@ func NewApp() *App {
 		switch event.Key() {
 		case tcell.KeyCtrlC:
 			a.ui.Stop()
-			for _, line := range a.result {
-				fmt.Println(line)
-			}
-			fmt.Printf("\n%s: %s\n", filepath.Base(os.Args[0]), a.getCommand())
+			fmt.Printf("%s--\n%s: %s\n", a.result.String(), getProgramName(), a.getCommand())
 		case tcell.KeyCtrlD:
 			return tcell.NewEventKey(tcell.KeyDelete, event.Rune(), event.Modifiers())
 		case tcell.KeyCtrlF:
@@ -90,15 +94,16 @@ func NewApp() *App {
 		return event
 	})
 
-	a.Count = tview.NewTextView()
-	a.Count.SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
-	a.Count.SetBackgroundColor(tcell.ColorDefault)
+	a.Size = tview.NewTextView()
+	a.Size.SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
+	a.Size.SetBackgroundColor(tcell.ColorDefault)
 
 	a.Text = tview.NewTextView()
 	a.Text.SetDynamicColors(true)
+	a.Text.SetBackgroundColor(tcell.Color235)
 
 	footer := tview.NewFlex()
-	footer.AddItem(a.Edit, 0, 1, true).AddItem(a.Count, 10, 0, false)
+	footer.AddItem(a.Edit, 0, 1, true).AddItem(a.Size, 12, 0, false)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow)
 	root.AddItem(a.Text, 0, 1, false).AddItem(footer, 1, 0, true)
@@ -122,23 +127,28 @@ func (a *App) runCommand(in io.Reader, synchronize bool) {
 
 	r := a.command(ctx, in)
 	if synchronize {
-		a.render(ctx, r)
+		a.render(r)
 	} else {
-		go a.render(ctx, r)
+		go a.render(r)
 	}
 }
 
-func (a *App) render(ctx context.Context, r io.Reader) {
-	s := bufio.NewScanner(r)
-	for s.Scan() {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			fmt.Fprintln(a.Text, tview.TranslateANSI(s.Text()))
+func (a *App) render(r io.Reader) {
+	w := tview.ANSIWriter(a.Text)
+	b := make([]byte, bufSize)
 
-			a.result = append(a.result, s.Text())
-			a.Count.SetText(fmt.Sprintf("%d lines", len(a.result)))
+	for {
+		n, err := r.Read(b)
+		if n > 0 {
+			es := tview.Escape(string(b[0:n]))
+			w.Write([]byte(es))
+
+			a.result.Write(b[0:n])
+			a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+			a.ui.Draw()
+		}
+		if err == io.EOF {
+			break
 		}
 	}
 }
@@ -214,8 +224,7 @@ func (br *bufferedReader) Read(p []byte) (n int, err error) {
 }
 
 func main() {
-	a := NewApp()
-	if err := a.Run(); err != nil {
+	if err := NewApp().Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
