@@ -1,0 +1,11 @@
+before:
+    hooks:
+        - go mod tidy
+builds:
+    - main: main.go
+      binary: goplumb
+      goos:
+          - darwin
+          - linux
+      goarch:
+          - amd64
