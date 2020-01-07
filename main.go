@@ -41,10 +41,12 @@ func getProgramName() string {
 }
 
 type App struct {
-	ui     *tview.Application
-	br     *bufferedReader
-	result *bytes.Buffer
-	cancel context.CancelFunc
+	ui      *tview.Application
+	br      *bufferedReader
+	result  *bytes.Buffer
+	cancel  context.CancelFunc
+	current int
+	history []string
 
 	Text *tview.TextView
 	Size *tview.TextView
@@ -53,10 +55,12 @@ type App struct {
 
 func NewApp(commandLine string) *App {
 	a := &App{
-		ui:     tview.NewApplication(),
-		br:     NewBufferedReader(os.Stdin),
-		result: bytes.NewBufferString(""),
-		cancel: nil,
+		ui:      tview.NewApplication(),
+		br:      NewBufferedReader(os.Stdin),
+		result:  bytes.NewBufferString(""),
+		cancel:  nil,
+		current: 0,
+		history: []string{},
 	}
 
 	a.Text = tview.NewTextView()
@@ -64,7 +68,7 @@ func NewApp(commandLine string) *App {
 	a.Text.SetBackgroundColor(tcell.Color235)
 
 	a.Size = tview.NewTextView()
-	a.Size.SetText("0 bytes").SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
+	a.Size.SetText("     0 bytes").SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
 	a.Size.SetBackgroundColor(tcell.ColorDefault)
 
 	a.Edit = tview.NewInputField()
@@ -73,14 +77,30 @@ func NewApp(commandLine string) *App {
 	a.Edit.SetBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetFieldBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetDoneFunc(func(key tcell.Key) {
-		a.reset()
-		a.runCommand(a.br.Reader())
+		switch key {
+		case tcell.KeyEnter:
+			a.reset()
+			a.runCommand(a.br.Reader())
+		}
 	})
 	a.Edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlC:
+			a.cancel()
 			a.ui.Stop()
-			fmt.Printf("%s--\n%s: %s\n", a.result.String(), getProgramName(), a.getCommand())
+			fmt.Printf("%s-- \n%s: %s\n", a.result.String(), getProgramName(), a.getCommand())
+		case tcell.KeyUp:
+			if a.current > 0 {
+				a.current--
+				a.Edit.SetText(a.history[a.current])
+				a.ui.Draw()
+			}
+		case tcell.KeyDown:
+			if a.current < len(a.history)-1 {
+				a.current++
+				a.Edit.SetText(a.history[a.current])
+				a.ui.Draw()
+			}
 		case tcell.KeyCtrlD:
 			return tcell.NewEventKey(tcell.KeyDelete, event.Rune(), event.Modifiers())
 		case tcell.KeyCtrlF:
@@ -122,6 +142,9 @@ func (a *App) runCommand(in io.Reader) {
 	w := tview.ANSIWriter(a.Text)
 	b := make([]byte, bufSize)
 
+	a.current = len(a.history)
+	a.history = append(a.history, a.getCommand())
+
 	go func() {
 		for {
 			select {
@@ -143,14 +166,6 @@ func (a *App) runCommand(in io.Reader) {
 			}
 		}
 	}()
-}
-
-func (a *App) reset() {
-	a.cancel()
-	a.result.Reset()
-	a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
-	a.Text.Clear()
-	a.ui.Draw()
 }
 
 func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
@@ -180,6 +195,15 @@ func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
 	}()
 
 	return r
+}
+
+func (a *App) reset() {
+	a.cancel()
+	a.result.Reset()
+
+	a.Size.SetText("     0 bytes")
+	a.Text.Clear()
+	a.ui.Draw()
 }
 
 func (a *App) Run() error {
