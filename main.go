@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"strings"
 
 	"github.com/gdamore/tcell"
 	"github.com/mattn/go-isatty"
@@ -46,12 +46,12 @@ type App struct {
 	result *bytes.Buffer
 	cancel context.CancelFunc
 
-	Edit *tview.InputField
 	Text *tview.TextView
 	Size *tview.TextView
+	Edit *tview.InputField
 }
 
-func NewApp() *App {
+func NewApp(commandLine string) *App {
 	a := &App{
 		ui:     tview.NewApplication(),
 		br:     NewBufferedReader(os.Stdin),
@@ -59,24 +59,22 @@ func NewApp() *App {
 		cancel: nil,
 	}
 
+	a.Text = tview.NewTextView()
+	a.Text.SetDynamicColors(true)
+	a.Text.SetBackgroundColor(tcell.Color235)
+
+	a.Size = tview.NewTextView()
+	a.Size.SetText("0 bytes").SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
+	a.Size.SetBackgroundColor(tcell.ColorDefault)
+
 	a.Edit = tview.NewInputField()
 	a.Edit.SetLabel(fmt.Sprintf("%s | ", getProgramName())).SetLabelColor(tcell.ColorForestGreen)
 	a.Edit.SetPlaceholder("cat").SetPlaceholderTextColor(tcell.ColorDarkGray)
 	a.Edit.SetBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetFieldBackgroundColor(tcell.ColorDefault)
 	a.Edit.SetDoneFunc(func(key tcell.Key) {
-		a.cancel()
-		a.Text.Clear()
-		a.Size.Clear()
-
-		a.br.mu.Lock()
-		a.result.Reset()
-		a.runCommand(a.br.Buffer(), true)
-		a.br.mu.Unlock()
-
-		if !a.br.eof {
-			a.runCommand(a.br, false)
-		}
+		a.reset()
+		a.runCommand(a.br.Reader())
 	})
 	a.Edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -90,17 +88,12 @@ func NewApp() *App {
 		case tcell.KeyCtrlB:
 			return tcell.NewEventKey(tcell.KeyLeft, event.Rune(), event.Modifiers())
 		}
-
 		return event
 	})
 
-	a.Size = tview.NewTextView()
-	a.Size.SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
-	a.Size.SetBackgroundColor(tcell.ColorDefault)
-
-	a.Text = tview.NewTextView()
-	a.Text.SetDynamicColors(true)
-	a.Text.SetBackgroundColor(tcell.Color235)
+	if commandLine != "" {
+		a.Edit.SetText(commandLine)
+	}
 
 	footer := tview.NewFlex()
 	footer.AddItem(a.Edit, 0, 1, true).AddItem(a.Size, 12, 0, false)
@@ -121,36 +114,43 @@ func (a *App) getCommand() string {
 	return commandLine
 }
 
-func (a *App) runCommand(in io.Reader, synchronize bool) {
+func (a *App) runCommand(in io.Reader) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 
 	r := a.command(ctx, in)
-	if synchronize {
-		a.render(r)
-	} else {
-		go a.render(r)
-	}
-}
-
-func (a *App) render(r io.Reader) {
 	w := tview.ANSIWriter(a.Text)
 	b := make([]byte, bufSize)
 
-	for {
-		n, err := r.Read(b)
-		if n > 0 {
-			es := tview.Escape(string(b[0:n]))
-			w.Write([]byte(es))
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				break
+			default:
+				n, err := r.Read(b)
+				if n > 0 {
+					es := tview.Escape(string(b[0:n]))
+					w.Write([]byte(es))
 
-			a.result.Write(b[0:n])
-			a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
-			a.ui.Draw()
+					a.result.Write(b[0:n])
+					a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+					a.ui.Draw()
+				}
+				if err != nil {
+					break
+				}
+			}
 		}
-		if err == io.EOF {
-			break
-		}
-	}
+	}()
+}
+
+func (a *App) reset() {
+	a.cancel()
+	a.result.Reset()
+	a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+	a.Text.Clear()
+	a.ui.Draw()
 }
 
 func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
@@ -169,6 +169,7 @@ func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
 
 	err = c.Start()
 	if err != nil {
+		a.cancel()
 		fmt.Fprintf(a.Text, "Error: %s", err)
 		return r
 	}
@@ -186,45 +187,37 @@ func (a *App) Run() error {
 		return fmt.Errorf("stdin not found")
 	}
 
-	a.runCommand(a.br, false)
+	a.runCommand(a.br)
 	return a.ui.Run()
 }
 
 type bufferedReader struct {
-	mu  sync.Mutex
 	in  io.Reader
 	buf *bytes.Buffer
-	eof bool
 }
 
 func NewBufferedReader(in io.Reader) *bufferedReader {
 	b := bytes.NewBufferString("")
 	r := io.TeeReader(in, b)
-	return &bufferedReader{
-		mu:  sync.Mutex{},
-		in:  r,
-		buf: b,
-		eof: false,
-	}
+	return &bufferedReader{in: r, buf: b}
 }
 
-func (br *bufferedReader) Buffer() *bytes.Buffer {
-	return bytes.NewBuffer(br.buf.Bytes())
+func (br *bufferedReader) Reader() io.Reader {
+	dup := bytes.NewBuffer(br.buf.Bytes())
+	return io.MultiReader(dup, br)
 }
 
 func (br *bufferedReader) Read(p []byte) (n int, err error) {
-	br.mu.Lock()
-	defer br.mu.Unlock()
-
-	n, err = br.in.Read(p)
-	if err == io.EOF {
-		br.eof = true
-	}
-	return
+	return br.in.Read(p)
 }
 
 func main() {
-	if err := NewApp().Run(); err != nil {
+	var args string
+	if len(os.Args) > 0 {
+		args = strings.Join(os.Args[1:], " ")
+	}
+
+	if err := NewApp(args).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
