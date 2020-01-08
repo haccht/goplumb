@@ -42,7 +42,7 @@ func getProgramName() string {
 
 type App struct {
 	ui      *tview.Application
-	br      *bufferedReader
+	in      *inputBuffer
 	result  *bytes.Buffer
 	cancel  context.CancelFunc
 	current int
@@ -56,7 +56,7 @@ type App struct {
 func NewApp(commandLine string) *App {
 	a := &App{
 		ui:      tview.NewApplication(),
-		br:      NewBufferedReader(os.Stdin),
+		in:      NewInputBuffer(os.Stdin),
 		result:  bytes.NewBufferString(""),
 		cancel:  nil,
 		current: 0,
@@ -64,25 +64,31 @@ func NewApp(commandLine string) *App {
 	}
 
 	a.Text = tview.NewTextView()
-	a.Text.SetDynamicColors(true)
-	a.Text.SetBackgroundColor(tcell.Color235)
+	a.Text.SetDynamicColors(true).
+		SetBackgroundColor(tcell.Color235)
 
 	a.Size = tview.NewTextView()
-	a.Size.SetText("     0 bytes").SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorDarkGray)
-	a.Size.SetBackgroundColor(tcell.ColorDefault)
+	a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len())).
+		SetTextAlign(tview.AlignRight).
+		SetTextColor(tcell.ColorDarkGray).
+		SetBackgroundColor(tcell.ColorDefault)
 
 	a.Edit = tview.NewInputField()
-	a.Edit.SetLabel(fmt.Sprintf("%s | ", getProgramName())).SetLabelColor(tcell.ColorForestGreen)
-	a.Edit.SetPlaceholder("cat").SetPlaceholderTextColor(tcell.ColorDarkGray)
-	a.Edit.SetBackgroundColor(tcell.ColorDefault)
-	a.Edit.SetFieldBackgroundColor(tcell.ColorDefault)
+	a.Edit.SetLabel(fmt.Sprintf("%s | ", getProgramName())).
+		SetLabelColor(tcell.ColorForestGreen).
+		SetPlaceholder("cat").
+		SetPlaceholderTextColor(tcell.ColorDarkGray).
+		SetFieldBackgroundColor(tcell.ColorDefault).
+		SetBackgroundColor(tcell.ColorDefault)
+
 	a.Edit.SetDoneFunc(func(key tcell.Key) {
 		switch key {
 		case tcell.KeyEnter:
 			a.reset()
-			a.runCommand(a.br.Reader())
+			a.runCommand(a.in.Reader())
 		}
 	})
+
 	a.Edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlC:
@@ -116,13 +122,24 @@ func NewApp(commandLine string) *App {
 	}
 
 	footer := tview.NewFlex()
-	footer.AddItem(a.Edit, 0, 1, true).AddItem(a.Size, 12, 0, false)
+	footer.AddItem(a.Edit, 0, 1, true).
+		AddItem(a.Size, 12, 0, false)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow)
-	root.AddItem(a.Text, 0, 1, false).AddItem(footer, 1, 0, true)
+	root.AddItem(a.Text, 0, 1, false).
+		AddItem(footer, 1, 0, true)
 
 	a.ui.SetRoot(root, true)
 	return a
+}
+
+func (a *App) Run() error {
+	if isatty.IsTerminal(os.Stdin.Fd()) {
+		return fmt.Errorf("stdin not found")
+	}
+
+	a.runCommand(a.in.Reader())
+	return a.ui.Run()
 }
 
 func (a *App) getCommand() string {
@@ -138,18 +155,18 @@ func (a *App) runCommand(in io.Reader) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 
+	a.current = len(a.history)
+	a.history = append(a.history, a.getCommand())
+
 	r := a.command(ctx, in)
 	w := tview.ANSIWriter(a.Text)
 	b := make([]byte, bufSize)
-
-	a.current = len(a.history)
-	a.history = append(a.history, a.getCommand())
 
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
-				break
+				return
 			default:
 				n, err := r.Read(b)
 				if n > 0 {
@@ -161,7 +178,7 @@ func (a *App) runCommand(in io.Reader) {
 					a.ui.Draw()
 				}
 				if err != nil {
-					break
+					return
 				}
 			}
 		}
@@ -200,39 +217,28 @@ func (a *App) command(ctx context.Context, in io.Reader) io.Reader {
 func (a *App) reset() {
 	a.cancel()
 	a.result.Reset()
-
-	a.Size.SetText("     0 bytes")
 	a.Text.Clear()
+	a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
 	a.ui.Draw()
 }
 
-func (a *App) Run() error {
-	if isatty.IsTerminal(os.Stdin.Fd()) {
-		return fmt.Errorf("stdin not found")
-	}
-
-	a.runCommand(a.br)
-	return a.ui.Run()
-}
-
-type bufferedReader struct {
-	in  io.Reader
+type inputBuffer struct {
+	r   io.Reader
 	buf *bytes.Buffer
 }
 
-func NewBufferedReader(in io.Reader) *bufferedReader {
+func NewInputBuffer(in io.Reader) *inputBuffer {
 	b := bytes.NewBufferString("")
 	r := io.TeeReader(in, b)
-	return &bufferedReader{in: r, buf: b}
+	return &inputBuffer{r: r, buf: b}
 }
 
-func (br *bufferedReader) Reader() io.Reader {
-	dup := bytes.NewBuffer(br.buf.Bytes())
-	return io.MultiReader(dup, br)
+func (in *inputBuffer) Buffer() *bytes.Buffer {
+	return bytes.NewBuffer(in.buf.Bytes())
 }
 
-func (br *bufferedReader) Read(p []byte) (n int, err error) {
-	return br.in.Read(p)
+func (in *inputBuffer) Reader() io.Reader {
+	return io.MultiReader(in.Buffer(), in.r)
 }
 
 func main() {
