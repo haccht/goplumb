@@ -46,7 +46,7 @@ func getShell() (string, error) {
 
 type App struct {
 	ui     *tview.Application
-	in     *inputBuffer
+	in     *InputBuffer
 	result *bytes.Buffer
 
 	pos     int
@@ -55,9 +55,9 @@ type App struct {
 	cmdDone chan struct{}
 	cmdStop context.CancelFunc
 
-	Text *tview.TextView
-	Size *tview.TextView
-	Edit *tview.InputField
+	text *tview.TextView
+	size *tview.TextView
+	edit *tview.InputField
 }
 
 func NewApp(commandLine string) *App {
@@ -67,55 +67,55 @@ func NewApp(commandLine string) *App {
 		result: bytes.NewBuffer(nil),
 	}
 
-	a.Text = tview.NewTextView()
-	a.Text.SetDynamicColors(true).
+	a.text = tview.NewTextView()
+	a.text.SetDynamicColors(true).
 		SetBackgroundColor(tcell.Color235)
 
-	a.Size = tview.NewTextView()
-	a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len())).
+	a.size = tview.NewTextView()
+	a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len())).
 		SetTextAlign(tview.AlignRight).
 		SetTextColor(tcell.ColorDarkGray).
 		SetBackgroundColor(tcell.ColorDefault)
 
-	a.Edit = tview.NewInputField()
-	a.Edit.SetLabel(fmt.Sprintf("%s | ", getName())).
+	a.edit = tview.NewInputField()
+	a.edit.SetLabel(fmt.Sprintf("%s | ", getName())).
 		SetLabelColor(tcell.ColorForestGreen).
 		SetPlaceholder("cat").
 		SetPlaceholderTextColor(tcell.ColorDarkGray).
 		SetFieldBackgroundColor(tcell.ColorDefault).
 		SetBackgroundColor(tcell.ColorDefault)
 
-	a.Edit.SetDoneFunc(func(key tcell.Key) {
+	a.edit.SetDoneFunc(func(key tcell.Key) {
 		switch key {
 		case tcell.KeyEnter:
 			a.cmdStop()
 			<-a.cmdDone
 
 			a.result.Reset()
-			a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
-			a.Text.Clear()
+			a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+			a.text.Clear()
 			go a.runCmd()
 		}
 	})
 
-	a.Edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	a.edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlC:
 			a.cmdStop()
 			<-a.cmdDone
 
 			a.ui.Stop()
-			fmt.Printf("%s", a.result.String())
-			fmt.Printf("-- \n%s: %s\n", getName(), a.getCmd())
-		case tcell.KeyUp:
+			fmt.Printf("%s-- \n", a.result.String())
+			fmt.Printf("%s: %s\n", getName(), a.getCmd())
+		case tcell.KeyUp, tcell.KeyCtrlP:
 			if a.pos > 0 {
 				a.pos--
-				a.Edit.SetText(a.history[a.pos])
+				a.edit.SetText(a.history[a.pos])
 			}
-		case tcell.KeyDown:
+		case tcell.KeyDown, tcell.KeyCtrlN:
 			if a.pos < len(a.history)-1 {
 				a.pos++
-				a.Edit.SetText(a.history[a.pos])
+				a.edit.SetText(a.history[a.pos])
 			}
 		case tcell.KeyCtrlD:
 			return tcell.NewEventKey(tcell.KeyDelete, event.Rune(), event.Modifiers())
@@ -128,15 +128,15 @@ func NewApp(commandLine string) *App {
 	})
 
 	if commandLine != "" {
-		a.Edit.SetText(commandLine)
+		a.edit.SetText(commandLine)
 	}
 
 	footer := tview.NewFlex()
-	footer.AddItem(a.Edit, 0, 1, true).
-		AddItem(a.Size, 12, 0, false)
+	footer.AddItem(a.edit, 0, 1, true).
+		AddItem(a.size, 12, 0, false)
 
 	root := tview.NewFlex().SetDirection(tview.FlexRow)
-	root.AddItem(a.Text, 0, 1, false).
+	root.AddItem(a.text, 0, 1, false).
 		AddItem(footer, 1, 0, true)
 
 	a.ui.SetRoot(root, true)
@@ -154,7 +154,7 @@ func (a *App) Run() error {
 }
 
 func (a *App) getCmd() string {
-	commandLine := a.Edit.GetText()
+	commandLine := a.edit.GetText()
 	if commandLine == "" {
 		commandLine = "cat"
 	}
@@ -170,25 +170,26 @@ func (a *App) runCmd() {
 	ctx, a.cmdStop = context.WithCancel(ctx)
 	defer a.cmdStop()
 
+	// ensure to stop subprocess properly
 	a.cmdDone = make(chan struct{})
 	defer close(a.cmdDone)
 
 	go func() {
-		buf := make([]byte, bufSize)
-		txt := tview.ANSIWriter(a.Text)
+		b := make([]byte, bufSize)
+		t := tview.ANSIWriter(a.text)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				n, err := r.Read(buf)
+				n, err := r.Read(b)
 				if n > 0 {
-					str := tview.Escape(string(buf[0:n]))
-					txt.Write([]byte(str))
+					str := tview.Escape(string(b[0:n]))
+					t.Write([]byte(str))
 
-					a.result.Write(buf[0:n])
-					a.Size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+					a.result.Write(b[0:n])
+					a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
 					a.ui.Draw()
 				}
 				if err != nil {
@@ -204,34 +205,31 @@ func (a *App) runCmd() {
 	c.Stdout = w
 	c.Stderr = w
 
-	err := c.Start()
-	if err != nil {
-		fmt.Fprintf(a.Text, "Error: %s", err)
-		return
-	}
-
 	a.pos = len(a.history)
 	a.history = append(a.history, a.getCmd())
 
-	c.Wait()
+	if err := c.Run(); err != nil {
+		fmt.Fprintf(a.text, "Error: %s", err)
+		return
+	}
 }
 
-type inputBuffer struct {
+type InputBuffer struct {
 	r   io.Reader
 	buf *bytes.Buffer
 }
 
-func NewInputBuffer(in io.Reader) *inputBuffer {
+func NewInputBuffer(in io.Reader) *InputBuffer {
 	b := bytes.NewBuffer(nil)
 	r := io.TeeReader(in, b)
-	return &inputBuffer{r: r, buf: b}
+	return &InputBuffer{r: r, buf: b}
 }
 
-func (in *inputBuffer) Buffer() *bytes.Buffer {
+func (in *InputBuffer) Buffer() *bytes.Buffer {
 	return bytes.NewBuffer(in.buf.Bytes())
 }
 
-func (in *inputBuffer) Reader() io.Reader {
+func (in *InputBuffer) Reader() io.Reader {
 	return io.MultiReader(in.Buffer(), in.r)
 }
 
