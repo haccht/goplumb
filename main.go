@@ -154,7 +154,7 @@ func (a *App) Run() error {
 }
 
 func (a *App) getCmd() string {
-	commandLine := a.edit.GetText()
+	commandLine := strings.TrimSpace(a.edit.GetText())
 	if commandLine == "" {
 		commandLine = "cat"
 	}
@@ -208,10 +208,7 @@ func (a *App) runCmd() {
 	a.pos = len(a.history)
 	a.history = append(a.history, a.getCmd())
 
-	if err := c.Run(); err != nil {
-		fmt.Fprintf(a.text, "Error: %s", err)
-		return
-	}
+	c.Run()
 }
 
 type InputBuffer struct {
