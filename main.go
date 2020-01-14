@@ -52,7 +52,6 @@ type App struct {
 	pos     int
 	history []string
 
-	cmdDone chan struct{}
 	cmdStop context.CancelFunc
 
 	text *tview.TextView
@@ -85,28 +84,20 @@ func NewApp(commandLine string) *App {
 		SetFieldBackgroundColor(tcell.ColorDefault).
 		SetBackgroundColor(tcell.ColorDefault)
 
-	a.edit.SetDoneFunc(func(key tcell.Key) {
-		switch key {
+	a.edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
 		case tcell.KeyEnter:
 			a.cmdStop()
-			<-a.cmdDone
-
 			a.result.Reset()
 			a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
 			a.text.Clear()
-			go a.runCmd()
-		}
-	})
-
-	a.edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
+			go a.execute()
 		case tcell.KeyCtrlC:
 			a.cmdStop()
-			<-a.cmdDone
-
 			a.ui.Stop()
+
 			fmt.Printf("%s-- \n", a.result.String())
-			fmt.Printf("%s: %s\n", getName(), a.getCmd())
+			fmt.Printf("%s: %s\n", getName(), a.command())
 		case tcell.KeyUp, tcell.KeyCtrlP:
 			if a.pos > 0 {
 				a.pos--
@@ -149,11 +140,11 @@ func (a *App) Run() error {
 		return err
 	}
 
-	go a.runCmd()
+	go a.execute()
 	return a.ui.Run()
 }
 
-func (a *App) getCmd() string {
+func (a *App) command() string {
 	commandLine := strings.TrimSpace(a.edit.GetText())
 	if commandLine == "" {
 		commandLine = "cat"
@@ -162,7 +153,7 @@ func (a *App) getCmd() string {
 	return commandLine
 }
 
-func (a *App) runCmd() {
+func (a *App) execute() {
 	r, w := io.Pipe()
 	defer w.Close()
 
@@ -170,43 +161,34 @@ func (a *App) runCmd() {
 	ctx, a.cmdStop = context.WithCancel(ctx)
 	defer a.cmdStop()
 
-	// ensure to stop subprocess properly
-	a.cmdDone = make(chan struct{})
-	defer close(a.cmdDone)
-
 	go func() {
 		b := make([]byte, bufSize)
 		t := tview.ANSIWriter(a.text)
 
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				n, err := r.Read(b)
-				if n > 0 {
-					str := tview.Escape(string(b[0:n]))
-					t.Write([]byte(str))
+			n, err := r.Read(b)
+			if n > 0 {
+				str := tview.Escape(string(b[0:n]))
+				t.Write([]byte(str))
 
-					a.result.Write(b[0:n])
-					a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
-					a.ui.Draw()
-				}
-				if err != nil {
-					return
-				}
+				a.result.Write(b[0:n])
+				a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+				a.ui.Draw()
+			}
+			if err != nil {
+				return
 			}
 		}
 	}()
 
 	shell, _ := getShell()
-	c := exec.CommandContext(ctx, shell, "-c", a.getCmd())
+	c := exec.CommandContext(ctx, shell, "-c", a.command())
 	c.Stdin = a.in.Reader()
 	c.Stdout = w
 	c.Stderr = w
 
 	a.pos = len(a.history)
-	a.history = append(a.history, a.getCmd())
+	a.history = append(a.history, a.command())
 
 	c.Run()
 }
