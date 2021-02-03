@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/mattn/go-isatty"
@@ -101,53 +102,57 @@ func (h *history) Append(line string) {
 	h.Lines = append(h.Lines, line)
 }
 
-type BufferedReader struct {
+type bufferedReader struct {
 	buf *bytes.Buffer
-	r   io.Reader
+	tr  io.Reader
+	mr  io.Reader
 }
 
-func NewBufferedReader(r io.Reader) *BufferedReader {
+func newBufferedReader(r io.Reader) *bufferedReader {
 	buf := bytes.NewBuffer(nil)
-	return &BufferedReader{
+	return &bufferedReader{
 		buf: buf,
-		r:   io.TeeReader(r, buf),
+		tr:  io.TeeReader(r, buf),
 	}
 }
 
-func (br *BufferedReader) Rewind() {
+func (br *bufferedReader) Rewind() {
 	buf := bytes.NewBuffer(br.buf.Bytes())
-	br.r = io.MultiReader(buf, br.r)
+	br.mr = io.MultiReader(buf, br.tr)
 }
 
-func (br *BufferedReader) Read(p []byte) (n int, err error) {
-	return br.r.Read(p)
+func (br *bufferedReader) Read(p []byte) (n int, err error) {
+	return br.mr.Read(p)
 }
 
 type App struct {
-	ui *tui
-	hi *history
-	br *BufferedReader
-
-	buf    *bytes.Buffer
+	ui     *tui
+	hi     *history
+	br     *bufferedReader
+	bu     *bytes.Buffer
+	wc     io.WriteCloser
+	wg     sync.WaitGroup
 	cancel context.CancelFunc
 }
 
-func NewApp() *App {
+func NewApp(command string) *App {
 	a := &App{
-		ui:  newTUI(),
-		hi:  &history{},
-		br:  NewBufferedReader(os.Stdin),
-		buf: bytes.NewBuffer(nil),
+		ui: newTUI(),
+		hi: &history{},
+		br: newBufferedReader(os.Stdin),
+		bu: bytes.NewBuffer(nil),
 	}
 
+	a.ui.CmdInput.SetText(command)
 	a.ui.CmdInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
 			a.Stop()
-			go a.Start()
+			a.Start()
 		case tcell.KeyCtrlC:
 			a.Stop()
-			fmt.Printf("%s-- \n", a.buf.String())
+			a.ui.Stop()
+			fmt.Printf("%s-- \n", a.bu.String())
 			fmt.Printf("%s: %s\n", getProgramName(), a.ui.GetInputText())
 		case tcell.KeyUp, tcell.KeyCtrlP:
 			a.ui.CmdInput.SetText(a.hi.Prev())
@@ -167,22 +172,31 @@ func NewApp() *App {
 }
 
 func (a *App) Start() {
-	r, w := io.Pipe()
-	defer w.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
 
-	a.buf.Reset()
+	rc, wc := io.Pipe()
+	a.wc = wc
+
+	a.hi.Append(a.ui.GetInputText())
+	a.bu.Reset()
+	a.br.Rewind()
+
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
+
 		b := make([]byte, bufSize)
 		t := tview.ANSIWriter(a.ui.MainView)
 
 		for {
-			n, err := r.Read(b)
+			n, err := rc.Read(b)
 			if n > 0 {
 				str := tview.Escape(string(b[0:n]))
 				t.Write([]byte(str))
 
-				a.buf.Write(b[0:n])
-				a.ui.SizeView.SetText(fmt.Sprintf("%6d bytes", a.buf.Len()))
+				a.bu.Write(b[0:n])
+				a.ui.SizeView.SetText(fmt.Sprintf("%6d bytes", a.bu.Len()))
 				a.ui.Draw()
 			}
 			if err != nil {
@@ -191,26 +205,25 @@ func (a *App) Start() {
 		}
 	}()
 
-	ctx := context.Background()
-	ctx, a.cancel = context.WithCancel(ctx)
-	defer a.cancel()
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
 
-	a.hi.Append(a.ui.GetInputText())
-	a.br.Rewind()
+		cmd := a.createCmd(ctx)
+		cmd.Stdin = a.br
+		cmd.Stdout = a.wc
+		cmd.Stderr = a.wc
 
-	c := a.createCmd(ctx)
-	c.Stdin = a.br
-	c.Stdout = w
-	c.Stderr = w
-
-	c.Run()
+		cmd.Run()
+	}()
 }
 
 func (a *App) Stop() {
+	a.cancel()
+	a.wc.Close()
+	a.wg.Wait()
+
 	a.ui.MainView.Clear()
-	if a.cancel != nil {
-		a.cancel()
-	}
 }
 
 func (a *App) Run() error {
@@ -218,7 +231,7 @@ func (a *App) Run() error {
 		return fmt.Errorf("stdin not found")
 	}
 
-	go a.Start()
+	a.Start()
 	return a.ui.Run()
 }
 
@@ -238,7 +251,7 @@ func (a *App) createCmd(ctx context.Context) *exec.Cmd {
 }
 
 func main() {
-	app := NewApp()
+	app := NewApp(strings.Join(os.Args[1:], " "))
 	if err := app.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
