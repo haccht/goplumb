@@ -10,104 +10,150 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gdamore/tcell"
+	"github.com/gdamore/tcell/v2"
 	"github.com/mattn/go-isatty"
 	"github.com/rivo/tview"
 )
 
-const bufSize = 32 * 1024
+const bufSize = 1024
 
 func getName() string {
 	return filepath.Base(os.Args[0])
 }
 
-func getShell() (string, error) {
-	if isatty.IsTerminal(os.Stdin.Fd()) {
-		return "", fmt.Errorf("stdin not found")
-	}
+type UI struct {
+	*tview.Application
+	layout *tview.Flex
+	footer *tview.Flex
 
-	shell := os.Getenv("SHELL")
-	if shell != "" {
-		return shell, nil
-	}
-
-	shell, _ = exec.LookPath("bash")
-	if shell != "" {
-		return shell, nil
-	}
-
-	shell, _ = exec.LookPath("sh")
-	if shell != "" {
-		return shell, nil
-	}
-
-	return "", fmt.Errorf("shell not found")
+	MainView *tview.TextView
+	SizeView *tview.TextView
+	CmdInput *tview.InputField
 }
 
-type App struct {
-	ui     *tview.Application
-	in     *InputBuffer
-	result *bytes.Buffer
+func NewUI() *UI {
+	ui := &UI{Application: tview.NewApplication()}
 
-	pos     int
-	history []string
-
-	cmdStop context.CancelFunc
-
-	text *tview.TextView
-	size *tview.TextView
-	edit *tview.InputField
-}
-
-func NewApp(commandLine string) *App {
-	a := &App{
-		ui:     tview.NewApplication(),
-		in:     NewInputBuffer(os.Stdin),
-		result: bytes.NewBuffer(nil),
-	}
-
-	a.text = tview.NewTextView()
-	a.text.SetDynamicColors(true).
+	ui.MainView = tview.NewTextView()
+	ui.MainView.
+		SetDynamicColors(true).
 		SetBackgroundColor(tcell.Color235)
 
-	a.size = tview.NewTextView()
-	a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len())).
+	ui.SizeView = tview.NewTextView()
+	ui.SizeView.
+		SetText(fmt.Sprint("0 bytes")).
 		SetTextAlign(tview.AlignRight).
 		SetTextColor(tcell.ColorDarkGray).
 		SetBackgroundColor(tcell.ColorDefault)
 
-	a.edit = tview.NewInputField()
-	a.edit.SetLabel(fmt.Sprintf("%s | ", getName())).
+	ui.CmdInput = tview.NewInputField()
+	ui.CmdInput.
+		SetLabel(fmt.Sprintf("%s | ", filepath.Base(os.Args[0]))).
 		SetLabelColor(tcell.ColorForestGreen).
 		SetPlaceholder("cat").
 		SetPlaceholderTextColor(tcell.ColorDarkGray).
 		SetFieldBackgroundColor(tcell.ColorDefault).
 		SetBackgroundColor(tcell.ColorDefault)
 
-	a.edit.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	ui.footer = tview.NewFlex()
+	ui.footer.
+		AddItem(ui.CmdInput, 0, 1, true).
+		AddItem(ui.SizeView, 12, 0, false)
+
+	ui.layout = tview.NewFlex().SetDirection(tview.FlexRow)
+	ui.layout.
+		AddItem(ui.MainView, 0, 1, false).
+		AddItem(ui.footer, 1, 0, true)
+
+	ui.SetRoot(ui.layout, true)
+	return ui
+}
+
+func (ui *UI) GetInputText() string {
+	text := strings.TrimSpace(ui.CmdInput.GetText())
+	if text == "" {
+		text = "cat"
+	}
+	return text
+}
+
+type History struct {
+	pos   int
+	Lines []string
+}
+
+func (h *History) Prev() string {
+	if h.pos > 0 {
+		h.pos--
+	}
+	return h.Lines[h.pos]
+}
+
+func (h *History) Next() string {
+	if h.pos < len(h.Lines)-1 {
+		h.pos++
+	}
+	return h.Lines[h.pos]
+}
+
+func (h *History) Append(line string) {
+	h.Lines = append(h.Lines, line)
+	h.pos = len(h.Lines)
+}
+
+type BufferedReader struct {
+	buf *bytes.Buffer
+	tr  io.Reader
+	mr  io.Reader
+}
+
+func NewBufferedReader(r io.Reader) *BufferedReader {
+	buf := bytes.NewBuffer(nil)
+	tr := io.TeeReader(r, buf)
+	return &BufferedReader{
+		buf: buf,
+		tr:  tr,
+		mr:  tr,
+	}
+}
+
+func (br *BufferedReader) Rewind() {
+	buf := bytes.NewBuffer(br.buf.Bytes())
+	br.mr = io.MultiReader(buf, br.tr)
+}
+
+func (br *BufferedReader) Read(p []byte) (n int, err error) {
+	return br.mr.Read(p)
+}
+
+type App struct {
+	ui *UI
+	hi *History
+	br *BufferedReader
+
+	buf    *bytes.Buffer
+	cancel context.CancelFunc
+}
+
+func NewApp() *App {
+	a := &App{
+		ui:  NewUI(),
+		hi:  &History{},
+		br:  NewBufferedReader(os.Stdin),
+		buf: bytes.NewBuffer(nil),
+	}
+
+	a.ui.CmdInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
-			a.cmdStop()
-			a.result.Reset()
-			a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
-			a.text.Clear()
-			go a.execute()
+			go a.Start()
 		case tcell.KeyCtrlC:
-			a.cmdStop()
-			a.ui.Stop()
-
-			fmt.Printf("%s-- \n", a.result.String())
-			fmt.Printf("%s: %s\n", getName(), a.command())
+			fmt.Printf("%s-- \n", a.buf.String())
+			fmt.Printf("%s: %s\n", getName(), a.ui.GetInputText())
 		case tcell.KeyUp, tcell.KeyCtrlP:
-			if a.pos > 0 {
-				a.pos--
-				a.edit.SetText(a.history[a.pos])
-			}
+			a.ui.CmdInput.SetText(a.hi.Prev())
 		case tcell.KeyDown, tcell.KeyCtrlN:
-			if a.pos < len(a.history)-1 {
-				a.pos++
-				a.edit.SetText(a.history[a.pos])
-			}
+			a.ui.CmdInput.SetText(a.hi.Next())
 		case tcell.KeyCtrlD:
 			return tcell.NewEventKey(tcell.KeyDelete, event.Rune(), event.Modifiers())
 		case tcell.KeyCtrlF:
@@ -118,52 +164,22 @@ func NewApp(commandLine string) *App {
 		return event
 	})
 
-	if commandLine != "" {
-		a.edit.SetText(commandLine)
-	}
-
-	footer := tview.NewFlex()
-	footer.AddItem(a.edit, 0, 1, true).
-		AddItem(a.size, 12, 0, false)
-
-	root := tview.NewFlex().SetDirection(tview.FlexRow)
-	root.AddItem(a.text, 0, 1, false).
-		AddItem(footer, 1, 0, true)
-
-	a.ui.SetRoot(root, true)
 	return a
 }
 
-func (a *App) Run() error {
-	_, err := getShell()
-	if err != nil {
-		return err
-	}
-
-	go a.execute()
-	return a.ui.Run()
-}
-
-func (a *App) command() string {
-	commandLine := strings.TrimSpace(a.edit.GetText())
-	if commandLine == "" {
-		commandLine = "cat"
-	}
-
-	return commandLine
-}
-
-func (a *App) execute() {
+func (a *App) Start() {
 	r, w := io.Pipe()
 	defer w.Close()
 
-	ctx := context.Background()
-	ctx, a.cmdStop = context.WithCancel(ctx)
-	defer a.cmdStop()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.buf.Reset()
+	a.ui.MainView.Clear()
 
 	go func() {
 		b := make([]byte, bufSize)
-		t := tview.ANSIWriter(a.text)
+		t := tview.ANSIWriter(a.ui.MainView)
 
 		for {
 			n, err := r.Read(b)
@@ -171,8 +187,8 @@ func (a *App) execute() {
 				str := tview.Escape(string(b[0:n]))
 				t.Write([]byte(str))
 
-				a.result.Write(b[0:n])
-				a.size.SetText(fmt.Sprintf("%6d bytes", a.result.Len()))
+				a.buf.Write(b[0:n])
+				a.ui.SizeView.SetText(fmt.Sprintf("%6d bytes", a.buf.Len()))
 				a.ui.Draw()
 			}
 			if err != nil {
@@ -181,44 +197,47 @@ func (a *App) execute() {
 		}
 	}()
 
-	shell, _ := getShell()
-	c := exec.CommandContext(ctx, shell, "-c", a.command())
-	c.Stdin = a.in.Reader()
+	ctx := context.Background()
+	ctx, a.cancel = context.WithCancel(ctx)
+	defer a.cancel()
+
+	a.hi.Append(a.ui.GetInputText())
+	a.br.Rewind()
+
+	c := a.createCmd(ctx)
+	c.Stdin = a.br
 	c.Stdout = w
 	c.Stderr = w
-
-	a.pos = len(a.history)
-	a.history = append(a.history, a.command())
 
 	c.Run()
 }
 
-type InputBuffer struct {
-	r   io.Reader
-	buf *bytes.Buffer
+func (a *App) Run() error {
+	if isatty.IsTerminal(os.Stdin.Fd()) {
+		return fmt.Errorf("stdin not found")
+	}
+
+	go a.Start()
+	return a.ui.Run()
 }
 
-func NewInputBuffer(in io.Reader) *InputBuffer {
-	b := bytes.NewBuffer(nil)
-	r := io.TeeReader(in, b)
-	return &InputBuffer{r: r, buf: b}
-}
+func (a *App) createCmd(ctx context.Context) *exec.Cmd {
+	shell := os.Getenv("SHELL")
+	if shell != "" {
+		return exec.CommandContext(ctx, shell, "-c", a.ui.GetInputText())
+	}
 
-func (in *InputBuffer) Buffer() *bytes.Buffer {
-	return bytes.NewBuffer(in.buf.Bytes())
-}
+	shell, _ = exec.LookPath("sh")
+	if shell != "" {
+		return exec.CommandContext(ctx, shell, "-c", a.ui.GetInputText())
+	}
 
-func (in *InputBuffer) Reader() io.Reader {
-	return io.MultiReader(in.Buffer(), in.r)
+	cmdArgs := strings.Fields(a.ui.GetInputText())
+	return exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 }
 
 func main() {
-	var args string
-	if len(os.Args) > 0 {
-		args = strings.Join(os.Args[1:], " ")
-	}
-
-	app := NewApp(args)
+	app := NewApp()
 	if err := app.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
