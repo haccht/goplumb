@@ -15,13 +15,13 @@ import (
 	"github.com/rivo/tview"
 )
 
-const bufSize = 1024
+const bufSize = 65536
 
-func getName() string {
+func getProgramName() string {
 	return filepath.Base(os.Args[0])
 }
 
-type UI struct {
+type tui struct {
 	*tview.Application
 	layout *tview.Flex
 	footer *tview.Flex
@@ -31,8 +31,8 @@ type UI struct {
 	CmdInput *tview.InputField
 }
 
-func NewUI() *UI {
-	ui := &UI{Application: tview.NewApplication()}
+func newTUI() *tui {
+	ui := &tui{Application: tview.NewApplication()}
 
 	ui.MainView = tview.NewTextView()
 	ui.MainView.
@@ -48,7 +48,7 @@ func NewUI() *UI {
 
 	ui.CmdInput = tview.NewInputField()
 	ui.CmdInput.
-		SetLabel(fmt.Sprintf("%s | ", filepath.Base(os.Args[0]))).
+		SetLabel(fmt.Sprintf("%s | ", getProgramName())).
 		SetLabelColor(tcell.ColorForestGreen).
 		SetPlaceholder("cat").
 		SetPlaceholderTextColor(tcell.ColorDarkGray).
@@ -69,7 +69,7 @@ func NewUI() *UI {
 	return ui
 }
 
-func (ui *UI) GetInputText() string {
+func (ui *tui) GetInputText() string {
 	text := strings.TrimSpace(ui.CmdInput.GetText())
 	if text == "" {
 		text = "cat"
@@ -77,58 +77,55 @@ func (ui *UI) GetInputText() string {
 	return text
 }
 
-type History struct {
+type history struct {
 	pos   int
 	Lines []string
 }
 
-func (h *History) Prev() string {
-	if h.pos > 0 {
+func (h *history) Prev() string {
+	if h.pos > 1 {
 		h.pos--
 	}
 	return h.Lines[h.pos]
 }
 
-func (h *History) Next() string {
+func (h *history) Next() string {
 	if h.pos < len(h.Lines)-1 {
 		h.pos++
 	}
 	return h.Lines[h.pos]
 }
 
-func (h *History) Append(line string) {
-	h.Lines = append(h.Lines, line)
+func (h *history) Append(line string) {
 	h.pos = len(h.Lines)
+	h.Lines = append(h.Lines, line)
 }
 
 type BufferedReader struct {
 	buf *bytes.Buffer
-	tr  io.Reader
-	mr  io.Reader
+	r   io.Reader
 }
 
 func NewBufferedReader(r io.Reader) *BufferedReader {
 	buf := bytes.NewBuffer(nil)
-	tr := io.TeeReader(r, buf)
 	return &BufferedReader{
 		buf: buf,
-		tr:  tr,
-		mr:  tr,
+		r:   io.TeeReader(r, buf),
 	}
 }
 
 func (br *BufferedReader) Rewind() {
 	buf := bytes.NewBuffer(br.buf.Bytes())
-	br.mr = io.MultiReader(buf, br.tr)
+	br.r = io.MultiReader(buf, br.r)
 }
 
 func (br *BufferedReader) Read(p []byte) (n int, err error) {
-	return br.mr.Read(p)
+	return br.r.Read(p)
 }
 
 type App struct {
-	ui *UI
-	hi *History
+	ui *tui
+	hi *history
 	br *BufferedReader
 
 	buf    *bytes.Buffer
@@ -137,8 +134,8 @@ type App struct {
 
 func NewApp() *App {
 	a := &App{
-		ui:  NewUI(),
-		hi:  &History{},
+		ui:  newTUI(),
+		hi:  &history{},
 		br:  NewBufferedReader(os.Stdin),
 		buf: bytes.NewBuffer(nil),
 	}
@@ -146,10 +143,12 @@ func NewApp() *App {
 	a.ui.CmdInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEnter:
+			a.Stop()
 			go a.Start()
 		case tcell.KeyCtrlC:
+			a.Stop()
 			fmt.Printf("%s-- \n", a.buf.String())
-			fmt.Printf("%s: %s\n", getName(), a.ui.GetInputText())
+			fmt.Printf("%s: %s\n", getProgramName(), a.ui.GetInputText())
 		case tcell.KeyUp, tcell.KeyCtrlP:
 			a.ui.CmdInput.SetText(a.hi.Prev())
 		case tcell.KeyDown, tcell.KeyCtrlN:
@@ -171,12 +170,7 @@ func (a *App) Start() {
 	r, w := io.Pipe()
 	defer w.Close()
 
-	if a.cancel != nil {
-		a.cancel()
-	}
 	a.buf.Reset()
-	a.ui.MainView.Clear()
-
 	go func() {
 		b := make([]byte, bufSize)
 		t := tview.ANSIWriter(a.ui.MainView)
@@ -210,6 +204,13 @@ func (a *App) Start() {
 	c.Stderr = w
 
 	c.Run()
+}
+
+func (a *App) Stop() {
+	a.ui.MainView.Clear()
+	if a.cancel != nil {
+		a.cancel()
+	}
 }
 
 func (a *App) Run() error {
