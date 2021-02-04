@@ -9,14 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/mattn/go-isatty"
 	"github.com/rivo/tview"
 )
 
-const bufSize = 65536
+const bufSize = 1024 * 16
 
 func getProgramName() string {
 	return filepath.Base(os.Args[0])
@@ -103,35 +102,65 @@ func (h *history) Append(line string) {
 }
 
 type bufferedReader struct {
+	r   io.Reader
+	ch  chan []byte
 	buf *bytes.Buffer
-	tr  io.Reader
-	mr  io.Reader
+	ctx context.Context
+	err error
 }
 
-func newBufferedReader(r io.Reader) *bufferedReader {
-	buf := bytes.NewBuffer(nil)
-	return &bufferedReader{
+func newBufferedReader(ctx context.Context, r io.Reader, buf *bytes.Buffer) *bufferedReader {
+	tr := io.TeeReader(r, buf)
+	mr := io.MultiReader(bytes.NewBuffer(buf.Bytes()), tr)
+	br := &bufferedReader{
+		r:   mr,
+		ch:  make(chan []byte),
 		buf: buf,
-		tr:  io.TeeReader(r, buf),
+		ctx: ctx,
 	}
+
+	go func() {
+		buf := make([]byte, bufSize)
+		for {
+			n, err := br.r.Read(buf)
+			if err != nil {
+				br.err = err
+				close(br.ch)
+				return
+			}
+
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			br.ch <- chunk
+		}
+	}()
+
+	return br
 }
 
-func (br *bufferedReader) Rewind() {
-	buf := bytes.NewBuffer(br.buf.Bytes())
-	br.mr = io.MultiReader(buf, br.tr)
+func (br *bufferedReader) Buffer() *bytes.Buffer {
+	return br.buf
 }
 
-func (br *bufferedReader) Read(p []byte) (n int, err error) {
-	return br.mr.Read(p)
+func (br *bufferedReader) Read(p []byte) (int, error) {
+	select {
+	case <-br.ctx.Done():
+		return 0, br.ctx.Err()
+	case chunk, ok := <-br.ch:
+		if !ok {
+			return 0, br.err
+		}
+		copy(p, chunk)
+		return len(chunk), nil
+	}
 }
 
 type App struct {
 	ui     *tui
 	hi     *history
-	br     *bufferedReader
 	bu     *bytes.Buffer
+	br     *bufferedReader
 	wc     io.WriteCloser
-	wg     sync.WaitGroup
 	cancel context.CancelFunc
 }
 
@@ -139,8 +168,8 @@ func NewApp(command string) *App {
 	a := &App{
 		ui: newTUI(),
 		hi: &history{},
-		br: newBufferedReader(os.Stdin),
 		bu: bytes.NewBuffer(nil),
+		br: newBufferedReader(context.Background(), os.Stdin, bytes.NewBuffer(nil)),
 	}
 
 	a.ui.CmdInput.SetText(command)
@@ -172,20 +201,18 @@ func NewApp(command string) *App {
 }
 
 func (a *App) Start() {
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-
 	rc, wc := io.Pipe()
 	a.wc = wc
 
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancel = cancel
+
+	buf := a.br.Buffer()
+	a.br = newBufferedReader(ctx, os.Stdin, buf)
 	a.hi.Append(a.ui.GetInputText())
 	a.bu.Reset()
-	a.br.Rewind()
 
-	a.wg.Add(1)
 	go func() {
-		defer a.wg.Done()
-
 		b := make([]byte, bufSize)
 		t := tview.ANSIWriter(a.ui.MainView)
 
@@ -205,10 +232,7 @@ func (a *App) Start() {
 		}
 	}()
 
-	a.wg.Add(1)
 	go func() {
-		defer a.wg.Done()
-
 		cmd := a.createCmd(ctx)
 		cmd.Stdin = a.br
 		cmd.Stdout = a.wc
@@ -219,9 +243,8 @@ func (a *App) Start() {
 }
 
 func (a *App) Stop() {
-	a.cancel()
 	a.wc.Close()
-	a.wg.Wait()
+	a.cancel()
 
 	a.ui.MainView.Clear()
 }
